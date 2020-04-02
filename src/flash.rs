@@ -79,7 +79,11 @@ impl<'a> FlashWriter<'a> {
         // Wait for any ongoing operations
         while self.flash.sr.sr().read().bsy().bit_is_set() {}
 
-        // NOTE(unsafe) write Keys to the key register
+        // NOTE(unsafe) write Keys to the key register. This is safe because the
+        // only side effect of these writes is to unlock the flash control
+        // register, which is the intent of this function. Do not rearrange the
+        // order of these writes or the control register will be permanently
+        // locked out until reset.
         unsafe { self.flash.keyr.keyr().write(|w| w.key().bits(KEY1)); }
         unsafe { self.flash.keyr.keyr().write(|w| w.key().bits(KEY2)); }
 
@@ -139,7 +143,10 @@ impl<'a> FlashWriter<'a> {
         self.flash.cr.cr().modify(|_, w| w.per().set_bit() );
 
         // Write address bits
-        // NOTE(unsafe) This sets the sector address in the Address Register
+        // NOTE(unsafe) This sets the page address in the Address Register.
+        // The side-effect of this write is that the page will be erased when we
+        // set the STRT bit in the CR below. The address is validated by the
+        // call to self.valid_address() above.
         unsafe { self.flash.ar.ar().write(|w| w.far().bits(FLASH_START + start_offset) ); }
 
         // Start Operation
@@ -219,8 +226,8 @@ impl<'a> FlashWriter<'a> {
             self.valid_address(offset + idx as u32)?;
 
             let hword: u16 =
-                  (data[idx]   as u16)
-                | (data[idx+1] as u16) << 8;
+                  (data[idx]   as u16) |
+                  (data[idx+1] as u16) << 8;
             let write_address = (FLASH_START + offset + idx as u32) as *mut u16;
 
             // Set Page Programming to 1
