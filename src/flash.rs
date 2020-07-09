@@ -13,7 +13,14 @@ pub const SZ_1K: u16 = 1024;
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyError {
+    address: u32,
+    expected: u16,
+    actual: u16
+}
+
+#[derive(Debug, Clone, Copy)]
 pub enum Error {
     AddressLargedThanFlash,
     AddressMisAligned,
@@ -22,7 +29,7 @@ pub enum Error {
     EraseError,
     ProgrammingError,
     WriteError,
-    VerifyError,
+    VerifyError(VerifyError),
     UnLockError,
     LockError,
 }
@@ -136,24 +143,42 @@ impl<'a> FlashWriter<'a> {
     pub fn page_erase(&mut self, start_offset: u32) -> Result<()> {
         self.valid_address(start_offset)?;
 
+        // If the sector if already erased, no need to erase it again, we can return early.
+        match self.verify_erased(start_offset) {
+            Ok(()) => {
+                return Ok(())
+            },
+            Err(Error::VerifyError(_)) => {},
+            Err(e) => return Err(e)
+        }
+
         // Unlock Flash
         self.unlock()?;
 
-        // Set Page Erase
-        self.flash.cr.cr().modify(|_, w| w.per().set_bit() );
+        // Set Page Erase, also clear other operation bits, they can prevent the
+        // page erase bit from being set.
+        self.flash.cr.cr().modify(|_, w| w.per().set_bit().
+                                           optpg().clear_bit().
+                                           opter().clear_bit().
+                                           mer().clear_bit().
+                                           pg().clear_bit());
 
         // Write address bits
         // NOTE(unsafe) This sets the page address in the Address Register.
         // The side-effect of this write is that the page will be erased when we
         // set the STRT bit in the CR below. The address is validated by the
         // call to self.valid_address() above.
-        unsafe { self.flash.ar.ar().write(|w| w.far().bits(FLASH_START + start_offset) ); }
+        let address: u32 = FLASH_START + start_offset;
+        unsafe { self.flash.ar.ar().write(|w| w.far().bits(address) ); }
 
         // Start Operation
         self.flash.cr.cr().modify(|_, w| w.strt().set_bit() );
 
         // Wait for operation to finish
-        while self.flash.sr.sr().read().bsy().bit_is_set() { }
+        while {
+            let sr = self.flash.sr.sr().read();
+            sr.bsy().bit_is_set() || sr.eop().bit_is_clear()
+        } {}
 
         // Check for errors
         let sr = self.flash.sr.sr().read();
@@ -161,27 +186,43 @@ impl<'a> FlashWriter<'a> {
         // Remove Page Erase Operation bit
         self.flash.cr.cr().modify(|_, w| w.per().clear_bit() );
 
-        // Re-lock flash
-        self.lock()?;
+        //
+        self.flash.sr.sr().modify(|_, w| w.eop().set_bit());
+
+
 
         if sr.wrprterr().bit_is_set() {
             self.flash.sr.sr().modify(|_, w| w.wrprterr().clear_bit() );
-            Err(Error::EraseError)
-        } else {
-            if self.verify {
-                let start = start_offset & !(self.sector_sz.kbytes() as u32 -1);
-                let end = start + self.sector_sz.kbytes() as u32 -1;
-                for idx in start..end {
-                    let write_address = (FLASH_START + idx as u32) as *const u16;
-                    let verify: u16 = unsafe { core::ptr::read_volatile(write_address) };
-                    if verify != 0xFFFF {
-                        return Err(Error::VerifyError);
-                    }
-                }
-            }
-
-            Ok(())
+            self.lock()?;
+            return Err(Error::EraseError);
         }
+
+        // Re-lock flash
+        self.lock()?;
+
+        if self.verify {
+           self.verify_erased(start_offset)?;
+        }
+
+        Ok(())
+    }
+
+    fn verify_erased(&mut self, start_offset: u32) -> Result<()> {
+        let start = start_offset & !(self.sector_sz.kbytes() as u32 -1);
+        let end = start + self.sector_sz.kbytes() as u32 -1;
+        for idx in start..end {
+            let write_address = (FLASH_START + idx as u32) as *const u16;
+            let verify: u16 = unsafe { core::ptr::read_volatile(write_address) };
+            if verify != 0xFFFF {
+                return Err(Error::VerifyError(VerifyError {
+                        address: write_address as u32,
+                        expected: 0xFFFF,
+                        actual: verify
+                }));
+            }
+        }
+
+        Ok(())
     }
 
     /// Erase the Flash Sectors from FLASH_START + start_offset to length
@@ -230,8 +271,15 @@ impl<'a> FlashWriter<'a> {
                   (data[idx+1] as u16) << 8;
             let write_address = (FLASH_START + offset + idx as u32) as *mut u16;
 
-            // Set Page Programming to 1
-            self.flash.cr.cr().modify(|_, w| w.pg().set_bit() );
+            // Set Page Programming to 1, also clear other operation bits, they
+            // can prevent the page programming bit from being set.
+            self.flash.cr.cr().modify(|_, w| w.pg().set_bit().
+                                             per().clear_bit().
+                                             optpg().clear_bit().
+                                             opter().clear_bit().
+                                             mer().clear_bit()
+
+                );
 
             while self.flash.sr.sr().read().bsy().bit_is_set() {}
 
@@ -263,7 +311,11 @@ impl<'a> FlashWriter<'a> {
                 let verify: u16 = unsafe { core::ptr::read_volatile(write_address) };
                 if verify != hword {
                     self.lock()?;
-                    return Err(Error::VerifyError);
+                    return Err(Error::VerifyError(VerifyError {
+                        address: write_address as u32,
+                        expected: hword,
+                        actual: verify
+                    }));
                 }
             }
         }
